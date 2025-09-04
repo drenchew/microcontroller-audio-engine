@@ -6,281 +6,282 @@
 #include "BluetoothA2DPSink.h"
 #include "driver/i2s.h"
 
-AudioGeneratorMP3 *mp3;
-AudioFileSourceLittleFS *file;
-AudioOutputI2SNoDAC *out;
+// consts 
+#define COMMAND_BUFFER_SIZE     32U
+#define SAMPLE_RATE            44100U
+#define DMA_BUF_COUNT          8U
+#define DMA_BUF_LEN            64U
+#define AUDIO_GAIN             0.8f
+#define SERIAL_BAUD_RATE       115200U
+#define LOOP_DELAY_MS          10U
+#define MAX_FILENAME_LEN       64U
 
-// internal dac by default
-BluetoothA2DPSink a2dp_sink;
-
-
-enum AudioMode {
-  MODE_MP3,
-  MODE_BLUETOOTH,
-  MODE_IDLE
-};
-
-AudioMode currentMode = MODE_IDLE;
-bool bluetoothEnabled = false;
+//  pin definitions
+#define I2S_BCLK_PIN           22U
+#define I2S_WCLK_PIN           25U
+#define I2S_DOUT_PIN           26U
 
 
-void stopMP3();
-void startBluetoothAudio();
-void stopBluetoothAudio();
+#define DEVICE_NAME            "ESP32_Audio_Player"
+#define MP3_EXTENSION          ".mp3"
+#define ROOT_DIR               "/"
 
-void listDir(fs::FS &fs, const char * dirname, uint8_t levels) {
-  Serial.printf("Listing directory: %s\n", dirname);
 
-  File root = fs.open(dirname);
-  if (!root) {
-    Serial.println("- failed to open directory");
-    return;
-  }
-  if (!root.isDirectory()) {
-    Serial.println("- not a directory");
-    return;
-  }
+static AudioGeneratorMP3 mp3;
+static AudioFileSourceLittleFS file;
+static AudioOutputI2SNoDAC out;
+static BluetoothA2DPSink a2dp_sink;
 
-  File file = root.openNextFile();
-  while (file) {
-    if (file.isDirectory()) {
-      Serial.print("  DIR : ");
-      Serial.println(file.name());
-      if (levels) {
-        listDir(fs, file.name(), levels - 1);
-      }
-    } else {
-      Serial.print("  FILE: ");
-      Serial.print(file.name());
-      Serial.print("\tSIZE: ");
-      Serial.println(file.size());
+
+typedef enum {
+    MODE_IDLE = 0U,
+    MODE_MP3,
+    MODE_BLUETOOTH
+} audio_mode_t;
+
+
+typedef enum {
+    RESULT_OK = 0U,
+    RESULT_ERROR,
+    RESULT_INVALID_PARAM,
+    RESULT_NOT_FOUND
+} result_code_t;
+
+static audio_mode_t current_mode = MODE_IDLE;
+static bool bluetooth_enabled = false;
+
+
+static void stop_mp3(void);
+static result_code_t start_bluetooth_audio(void);
+static void stop_bluetooth_audio(void);
+static result_code_t play_mp3(const char* filename);
+static void list_dir(fs::FS &fs, const char * dirname, uint8_t levels);
+static void convert_to_lowercase(char* str, size_t len);
+static result_code_t find_and_play_mp3(void);
+static void print_system_info(void);
+static void print_help(void);
+
+
+static void list_dir(fs::FS &fs, const char * dirname, uint8_t levels) {
+    if (dirname == NULL) {
+        Serial.println("Invalid directory name");
+        return;
     }
-    file = root.openNextFile();
-  }
+    
+    Serial.printf("Listing directory: %s\n", dirname);
+    File root = fs.open(dirname);
+    if (!root || !root.isDirectory()) {
+        Serial.println("- failed to open directory");
+        return;
+    }
+
+    File entry = root.openNextFile();
+    while (entry) {
+        if (entry.isDirectory()) {
+            Serial.printf("DIR  : %s\n", entry.name());
+            if (levels > 0U) {
+                list_dir(fs, entry.name(), levels - 1U);
+            }
+        } else {
+            Serial.printf("File : %s\tSize : %u\n", entry.name(), (unsigned int)entry.size());
+        }
+        entry = root.openNextFile();
+    }
 }
 
-void startBluetoothAudio() {
-  if (currentMode == MODE_BLUETOOTH) return;
-  
- 
-  stopMP3();
-  
-  Serial.println("Starting Bluetooth Audio...");
-  currentMode = MODE_BLUETOOTH;
-  
- 
-  Serial.println("Initializing Bluetooth A2DP Sink for Internal DAC...");
-  Serial.println("Device name: ESP32_Audio_Player");
-  
-  // Configure I2S for internal DAC (built-in DAC mode)
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
-    .sample_rate = 44100,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_MSB,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,
-    .dma_buf_len = 64,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,
-    .fixed_mclk = 0
-  };
-  
-  
-  a2dp_sink.set_i2s_config(i2s_config);
-  
-  
-  a2dp_sink.start("ESP32_Audio_Player");
-  
-  bluetoothEnabled = true;
-  
-  Serial.println("Bluetooth Audio started!");
-  Serial.println("Audio configured for internal DAC on pins 25 and 26");
-  Serial.println("Ready to pair - look for 'ESP32_Audio_Player' in your phone's Bluetooth settings");
+
+static result_code_t start_bluetooth_audio(void) {
+    if (current_mode == MODE_BLUETOOTH) {
+        return RESULT_OK;
+    }
+    stop_mp3();
+
+    Serial.println("Starting Bluetooth Audio...");
+    current_mode = MODE_BLUETOOTH;
+
+    // I2S config for internal DAC
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_MSB,
+        .intr_alloc_flags = 0,
+        .dma_buf_count = DMA_BUF_COUNT,
+        .dma_buf_len = DMA_BUF_LEN,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+
+    a2dp_sink.set_i2s_config(i2s_config);
+    a2dp_sink.start(DEVICE_NAME);
+    bluetooth_enabled = true;
+
+    Serial.println("Bluetooth Audio started! Ready to pair.");
+    return RESULT_OK;
 }
 
-void stopBluetoothAudio() {
-  if (!bluetoothEnabled) return;
-  
-  Serial.println("Stopping Bluetooth Audio...");
-  
-  // Stop A2DP sink
-  a2dp_sink.end();
-  
-  bluetoothEnabled = false;
-  currentMode = MODE_IDLE;
-  Serial.println("Bluetooth Audio stopped!");
+
+static void stop_bluetooth_audio(void) {
+    if (!bluetooth_enabled) {
+        return;
+    }
+    Serial.println("Stopping Bluetooth Audio...");
+    a2dp_sink.end();
+    bluetooth_enabled = false;
+    current_mode = MODE_IDLE;
 }
 
-void playMP3(const char* filename) {
-  if (currentMode == MODE_MP3) return;
-  
-  stopBluetoothAudio();
-  
-  Serial.printf("Starting MP3 playback: %s\n", filename);
-  currentMode = MODE_MP3;
-  
 
-  file = new AudioFileSourceLittleFS(filename);
-  out = new AudioOutputI2SNoDAC();
-  mp3 = new AudioGeneratorMP3();
-  
- 
-  out->SetPinout(22, 25, 26); // bclk, wclk, dout (using internal DAC pins)
-  out->SetChannels(1); // Mono output
-  out->SetGain(0.8); // Adjust volume (0.0 to 1.0)
-  
- 
-  mp3->begin(file, out);
-  
-  Serial.println("MP3 playback started!");
+static result_code_t play_mp3(const char* filename) {
+    if (filename == NULL) {
+        return RESULT_INVALID_PARAM;
+    }
+    
+    if (current_mode == MODE_MP3) {
+        return RESULT_OK;
+    }
+    stop_bluetooth_audio();
+
+    Serial.printf("Starting MP3 playback: %s\n", filename);
+    current_mode = MODE_MP3;
+
+    file = AudioFileSourceLittleFS(filename);
+    out = AudioOutputI2SNoDAC();
+    mp3 = AudioGeneratorMP3();
+
+    out.SetPinout(I2S_BCLK_PIN, I2S_WCLK_PIN, I2S_DOUT_PIN); // BCLK, WCLK, DOUT
+    out.SetChannels(1);
+    out.SetGain(AUDIO_GAIN);
+
+    mp3.begin(&file, &out);
+    return RESULT_OK;
 }
 
-void stopMP3() {
-  if (mp3) {
-    mp3->stop();
-    delete mp3;
-    delete file;
-    delete out;
-    mp3 = nullptr;
-    file = nullptr;
-    out = nullptr;
-    currentMode = MODE_IDLE;
-    Serial.println("MP3 playback stopped!");
-  }
+
+static void stop_mp3(void) {
+    if (mp3.isRunning()) {
+        mp3.stop();
+        current_mode = MODE_IDLE;
+        Serial.println("MP3 playback stopped!");
+    }
 }
+
+
+static void convert_to_lowercase(char* str, size_t len) {
+    if (str == NULL) {
+        return;
+    }
+    
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] >= 'A' && str[i] <= 'Z') {
+            str[i] += 32;
+        }
+    }
+}
+
+
+static result_code_t find_and_play_mp3(void) {
+    File root = LittleFS.open(ROOT_DIR);
+    if (!root) {
+        Serial.println("Failed to open root directory");
+        return RESULT_ERROR;
+    }
+    
+    File entry = root.openNextFile();
+    while (entry) {
+        if (strstr(entry.name(), MP3_EXTENSION) != NULL) {
+            result_code_t result = play_mp3(entry.name());
+            return result;
+        }
+        entry = root.openNextFile();
+    }
+    
+    Serial.println("No MP3 files found");
+    return RESULT_NOT_FOUND;
+}
+
+
+static void print_system_info(void) {
+    const char* mode_str;
+    
+    switch (current_mode) {
+        case MODE_MP3:
+            mode_str = "MP3";
+            break;
+        case MODE_BLUETOOTH:
+            mode_str = "Bluetooth";
+            break;
+        case MODE_IDLE:
+        default:
+            mode_str = "Idle";
+            break;
+    }
+    
+    Serial.printf("Current mode: %s\n", mode_str);
+    Serial.printf("Bluetooth enabled: %s\n", bluetooth_enabled ? "Yes" : "No");
+}
+
+
+static void print_help(void) {
+    Serial.println("Commands: play/p, bt/b, stop/s, info, help");
+}
+
 
 void setup() {
-  Serial.begin(115200);
-  
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS Mount Failed!");
-    return;
-  }
-
-  Serial.println("=== ESP32 Multi-Audio Player (DAC Pin 25) ===");
-  Serial.println("Features: MP3 Files + Bluetooth Audio");
-  
-  listDir(LittleFS, "/", 1);
-  
-
-  size_t totalBytes = LittleFS.totalBytes();
-  size_t usedBytes = LittleFS.usedBytes();
-  Serial.printf("Filesystem: %d/%d bytes used (%.1f%%)\n", 
-                usedBytes, totalBytes, (usedBytes * 100.0) / totalBytes);
-  Serial.printf("Available for audio: %.1f MB\n", (totalBytes - usedBytes) / 1024.0 / 1024.0);
-  
-
-  File root = LittleFS.open("/");
-  File file = root.openNextFile();
-  bool foundMP3 = false;
-  
-  while (file) {
-    String name = file.name();
-    if (name.endsWith(".mp3")) {
-      size_t fileSize = file.size();
-      Serial.printf("Found MP3: %s (%d bytes = %.1f KB)\n", 
-                    name.c_str(), fileSize, fileSize / 1024.0);
-      
-      // Estimate duration (rough: ~1KB per second for typical MP3)
-      float estimatedDuration = fileSize / 1024.0;
-      Serial.printf("Estimated duration: %.1f seconds\n", estimatedDuration);
-      foundMP3 = true;
+    Serial.begin(SERIAL_BAUD_RATE);
+    
+    if (!LittleFS.begin(true)) {
+        Serial.println("LittleFS Mount Failed!");
+        return;
     }
-    file = root.openNextFile();
-  }
-  
-  if (!foundMP3) {
-    Serial.println("\n*** No MP3 files found! ***");
-  }
-  
-  Serial.println("\n=== Available Commands ===");
-  Serial.println("p or play    - Play MP3 files");
-  Serial.println("b or bt      - Start Bluetooth audio");
-  Serial.println("s or stop    - Stop current audio");
-  Serial.println("info         - Show system information");
-  Serial.println("help         - Show this help");
-  
-  Serial.println("\nReady! Type 'p' to play MP3 or 'help' for commands");
+
+    Serial.println("=== ESP32 Multi-Audio Player ===");
+    list_dir(LittleFS, ROOT_DIR, 1U);
+
+    Serial.println("\nAvailable commands: play/p, bt/b, stop/s, info, help");
 }
 
+
 void loop() {
+    static char cmd[COMMAND_BUFFER_SIZE];
 
-  if (currentMode == MODE_MP3 && mp3 && mp3->isRunning()) {
-    if (!mp3->loop()) {
-      Serial.println("MP3 playback finished");
-      stopMP3();
-      
-      // Auto-restart MP3 after 2 seconds
-      delay(2000);
-      Serial.println("Restarting MP3 playback...");
-      File root = LittleFS.open("/");
-      File file = root.openNextFile();
-      while (file) {
-        String name = file.name();
-        if (name.endsWith(".mp3")) {
-          playMP3(("/" + name).c_str());
-          break;
-        }
-        file = root.openNextFile();
-      }
-    }
-  }
-  
+    if (Serial.available()) {
+        size_t len = Serial.readBytesUntil('\n', cmd, sizeof(cmd) - 1U);
+        cmd[len] = '\0'; 
 
-  if (Serial.available()) {
-    String cmd = Serial.readString();
-    cmd.trim();
-    cmd.toLowerCase();
-    
-    if (cmd == "p" || cmd == "play") {
-      // Switch to MP3 mode
-      File root = LittleFS.open("/");
-      File file = root.openNextFile();
-      while (file) {
-        String name = file.name();
-        if (name.endsWith(".mp3")) {
-          Serial.println("Switching to MP3 playback...");
-          playMP3(("/" + name).c_str());
-          break;
+        convert_to_lowercase(cmd, len);
+
+        if (strcmp(cmd, "play") == 0 || strcmp(cmd, "p") == 0) {
+            result_code_t result = find_and_play_mp3();
+            if (result != RESULT_OK) {
+                Serial.println("Failed to start MP3 playback");
+            }
+        } else if (strcmp(cmd, "bt") == 0 || strcmp(cmd, "b") == 0) {
+            result_code_t result = start_bluetooth_audio();
+            if (result != RESULT_OK) {
+                Serial.println("Failed to start Bluetooth audio");
+            }
+        } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "s") == 0) {
+            stop_mp3();
+            stop_bluetooth_audio();
+        } else if (strcmp(cmd, "info") == 0) {
+            print_system_info();
+        } else if (strcmp(cmd, "help") == 0) {
+            print_help();
+        } else {
+            Serial.printf("Unknown command: %s\n", cmd);
         }
-        file = root.openNextFile();
-      }
-    } else if (cmd == "b" || cmd == "bt" || cmd == "bluetooth") {
-      // Switch to Bluetooth mode
-      Serial.println("Switching to Bluetooth mode...");
-      startBluetoothAudio();
-    } else if (cmd == "s" || cmd == "stop") {
-      // Stop all audio
-      Serial.println("Stopping all audio...");
-      stopMP3();
-      stopBluetoothAudio();
-    } else if (cmd == "info") {
-      Serial.println("\n=== System Info ===");
-      Serial.printf("Current mode: %s\n", 
-        currentMode == MODE_MP3 ? "MP3" : 
-        currentMode == MODE_BLUETOOTH ? "Bluetooth" : "Idle");
-      Serial.printf("Bluetooth enabled: %s\n", bluetoothEnabled ? "Yes" : "No");
-      
-      listDir(LittleFS, "/", 1);
-      size_t totalBytes = LittleFS.totalBytes();
-      size_t usedBytes = LittleFS.usedBytes();
-      Serial.printf("Storage: %d/%d bytes (%.1f%% used)\n", 
-                    usedBytes, totalBytes, (usedBytes * 100.0) / totalBytes);
-    } else if (cmd == "help") {
-      Serial.println("\n=== Available Commands ===");
-      Serial.println("p or play    - Play MP3 files");
-      Serial.println("b or bt      - Start Bluetooth audio");
-      Serial.println("s or stop    - Stop current audio");
-      Serial.println("info         - Show system information");
-      Serial.println("help         - Show this help");
-    } else {
-      Serial.printf("Unknown command: %s\n", cmd.c_str());
-      Serial.println("Type 'help' for available commands");
     }
-  }
-  
-  // Small delay to prevent watchdog issues
-  delay(10);
+
+
+    if (current_mode == MODE_MP3 && mp3.isRunning()) {
+        if (!mp3.loop()) {
+            Serial.println("MP3 playback finished");
+            stop_mp3();
+        }
+    }
+
+    delay(LOOP_DELAY_MS);
 }
